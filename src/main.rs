@@ -1,16 +1,12 @@
 use anyhow::Result;
-use async_channel::unbounded;
-use async_compat::CompatExt;
-use bytes::Bytes;
 use clap::Parser;
 use etherparse::{IcmpEchoHeader, Icmpv4Header, IpNumber};
-use ipstack_geph::stream::IpStackStream;
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+use ipstack::{stream::IpStackStream, IpStack, IpStackConfig};
+use std::net::{IpAddr, SocketAddr};
+use tokio::{
+    io::{split, AsyncWriteExt},
+    net::TcpStream,
 };
-use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use udp_stream::UdpStream;
 
 const MTU: u16 = 1400;
@@ -30,12 +26,16 @@ pub enum ArgVerbosity {
 #[derive(Parser)]
 #[command(author, version, about = "Testing app for tun.", long_about = None)]
 struct Args {
+    /// echo server address, likes `127.0.0.1:4000`
+    #[arg(short, long, value_name = "IP:port", default_value = "127.0.0.1:4000")]
+    vpn_addr: SocketAddr,
+
     /// echo server address, likes `127.0.0.1`
-    #[arg(short, long, value_name = "IP address")]
+    #[arg(short, long, value_name = "IP address", default_value = "127.0.0.1")]
     server_addr: IpAddr,
 
     /// tcp timeout
-    #[arg(long, value_name = "seconds", default_value = "60")]
+    #[arg(long, value_name = "seconds", default_value = "10")]
     tcp_timeout: u64,
 
     /// udp timeout
@@ -54,70 +54,16 @@ async fn main() -> Result<()> {
     let default = format!("{:?}", args.verbosity);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
 
-    let ipv4 = Ipv4Addr::new(10, 0, 0, 33);
-    let netmask = Ipv4Addr::new(255, 255, 255, 0);
-    // let gateway = Ipv4Addr::new(10, 0, 0, 1);
-
-    let mut tun_config = tun2::Configuration::default();
-    tun_config.address(ipv4).netmask(netmask).mtu(MTU).up();
-
-    tun_config.platform_config(|p_cfg| {
-        p_cfg.ensure_root_privileges(true);
-    });
-
-    let mut ipstack_config = ipstack_geph::IpStackConfig::default();
+    let mut ipstack_config = IpStackConfig::default();
     ipstack_config.mtu = MTU;
     ipstack_config.tcp_timeout = std::time::Duration::from_secs(args.tcp_timeout);
     ipstack_config.udp_timeout = std::time::Duration::from_secs(args.udp_timeout);
 
-    // TUN デバイスの作成
-    let tun = Arc::new(tun2::create_as_async(&tun_config)?);
+    let mut vpn_stream = UdpStream::connect(args.vpn_addr).await?;
+    let buf: [u8; 1] = [0];
+    vpn_stream.write_all(&buf).await?;
 
-    let (ipstack_input_tx, ipstack_input_rx) = unbounded::<Bytes>();
-    let (ipstack_output_tx, ipstack_output_rx) = unbounded::<Bytes>();
-
-    // TUN から読み取り、ipstack へ送信
-    {
-        let tun_clone = tun.clone();
-        let ipstack_input_tx = ipstack_input_tx.clone();
-        tokio::spawn(async move {
-            let result: Result<(), anyhow::Error> = async {
-                let mut buf = vec![0u8; MTU as usize];
-                loop {
-                    let n = tun_clone.recv(&mut buf).await?;
-                    ipstack_input_tx
-                        .send(Bytes::copy_from_slice(&buf[..n]))
-                        .await?;
-                }
-            }
-            .await;
-
-            if let Err(e) = result {
-                log::error!("Error in TUN reader task: {:?}", e);
-            }
-        });
-    }
-
-    // ipstack から読み取り、TUN へ書き込み
-    {
-        let tun_clone = tun.clone();
-        let ipstack_output_rx = ipstack_output_rx.clone();
-        tokio::spawn(async move {
-            let result: Result<(), anyhow::Error> = async {
-                while let Ok(bytes) = ipstack_output_rx.recv().await {
-                    tun_clone.send(&bytes).await?;
-                }
-                Ok(())
-            }
-            .await;
-
-            if let Err(e) = result {
-                log::error!("Error in TUN writer task: {:?}", e);
-            }
-        });
-    }
-
-    let ip_stack = ipstack_geph::IpStack::new(ipstack_config, ipstack_input_rx, ipstack_output_tx);
+    let mut ip_stack = IpStack::new(ipstack_config, vpn_stream);
 
     let server_addr = args.server_addr;
 
@@ -137,7 +83,6 @@ async fn main() -> Result<()> {
                 let connect_addr: SocketAddr =
                     format!("{}:{}", server_addr, remote_addr.port()).parse()?;
                 let server_tcp = TcpStream::connect(connect_addr).await?;
-                let client_tcp = client_tcp.compat();
 
                 // ストリームを分割
                 let (mut client_read, mut client_write) = split(client_tcp);
@@ -170,57 +115,32 @@ async fn main() -> Result<()> {
                 );
                 let connect_addr: SocketAddr =
                     format!("{}:{}", server_addr, remote_addr.port()).parse()?;
-                let mut server_udp = UdpStream::connect(connect_addr).await?;
+                let server_udp = UdpStream::connect(connect_addr).await?;
+
+                // ストリームを分割
+                let (mut client_read, mut client_write) = split(client_udp);
+                let (mut server_read, mut server_write) = split(server_udp);
 
                 tokio::spawn(async move {
-                    let mut server_buf = vec![0u8; 4096];
+                    let client_to_server = async {
+                        tokio::io::copy(&mut client_read, &mut server_write).await?;
+                        server_write.shutdown().await
+                    };
 
-                    loop {
-                        tokio::select! {
-                            result = client_udp.recv() => {
-                                match result {
-                                    Ok(client_buf) => {
-                                        if client_buf.len() == 0 {
-                                            // クライアントからの接続が終了
-                                            break;
-                                        }
-                                        if let Err(e) = server_udp.write(&client_buf).await {
-                                            log::error!("Error sending to server_udp: {:?}", e);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("Error receiving from client_udp: {:?}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            result = server_udp.read(&mut server_buf) => {
-                                match result {
-                                    Ok(n) => {
-                                        if n == 0 {
-                                            // サーバーからの接続が終了
-                                            break;
-                                        }
-                                        if let Err(e) = client_udp.send(&server_buf[..n]).await {
-                                            log::error!("Error sending to client_udp: {:?}", e);
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("Error receiving from server_udp: {:?}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                    let server_to_client = async {
+                        tokio::io::copy(&mut server_read, &mut client_write).await?;
+                        client_write.shutdown().await
+                    };
+
+                    if let Err(e) = tokio::try_join!(client_to_server, server_to_client) {
+                        log::error!("UDP proxy error: {:?}", e);
                     }
                 });
             }
 
             IpStackStream::UnknownTransport(u) => {
                 let n = number;
-                if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
+                if u.src_addr().is_ipv4() && IpNumber::from(u.ip_protocol()) == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
                         log::info!("#{n} ICMPv4 echo");
